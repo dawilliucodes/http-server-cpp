@@ -40,7 +40,7 @@ bool set_nonblocking(int fd) {
   return true;
 }
 
-Worker::Worker(std::filesystem::path doc_root) : doc_root_(std::move(doc_root)) {}
+Worker::Worker(int doc_root_fd) : doc_root_fd_(doc_root_fd) {}
 
 Worker::~Worker() {
   join();
@@ -112,8 +112,6 @@ void Worker::run() {
       deadline = std::chrono::steady_clock::now() + kDrainGrace;
     }
 
-    // open connections are left alone: one may hold a response already
-    // promising keep-alive. later requests get Connection: close instead.
     if (draining) {
       if (connections_.empty()) break;
       if (std::chrono::steady_clock::now() >= deadline) {
@@ -194,7 +192,7 @@ void Worker::sweep_idle() {
 
 void Worker::handle_readable(int fd) {
   auto it = connections_.find(fd);
-  if (it == connections_.end()) return;  // already closed
+  if (it == connections_.end()) return;
 
   char chunk[kReadBlock];
   ssize_t n = read(fd, chunk, sizeof(chunk));
@@ -204,7 +202,7 @@ void Worker::handle_readable(int fd) {
     close_connection(fd);
     return;
   }
-  if (n == 0) {  // peer hung up
+  if (n == 0) {
     close_connection(fd);
     return;
   }
@@ -216,8 +214,6 @@ void Worker::handle_readable(int fd) {
 }
 
 void Worker::process_buffered(int fd, ConnectionState& state) {
-  // the marker case matters: without it a request slips through whenever its
-  // terminator lands in the same read that crosses the cap
   const size_t marker = state.read_buffer.find("\r\n\r\n");
   const bool too_big = marker == std::string::npos ? state.read_buffer.size() > kMaxRequestSize
                                                    : marker + 4 > kMaxRequestSize;
@@ -229,12 +225,11 @@ void Worker::process_buffered(int fd, ConnectionState& state) {
 
   state.request_started = std::chrono::steady_clock::now();
 
-  // points into read_buffer, so respond before erasing
   const std::string_view header_text(state.read_buffer.data(), marker + 2);
 
   Response response;
   try {
-    response = handle_request(header_text, doc_root_, !stopping_.load());
+    response = handle_request(header_text, doc_root_fd_, !stopping_.load());
   } catch (const std::exception& e) {
     log_line(std::string("request handler threw: ") + e.what());
     response.text = build_error_response(500, "Internal Server Error");
@@ -245,7 +240,7 @@ void Worker::process_buffered(int fd, ConnectionState& state) {
     response.status = 500;
   }
 
-  state.read_buffer.erase(0, marker + 4);  // anything left starts the next request
+  state.read_buffer.erase(0, marker + 4);
   state.write_buffer = std::move(response.text);
   state.write_offset = 0;
   state.keep_alive = response.keep_alive;
@@ -268,7 +263,7 @@ void Worker::queue_error(int fd, ConnectionState& state, int status, std::string
 
 bool Worker::switch_to(int fd, ConnectionState& state, uint32_t events, Stage stage) {
   if (!watch(EPOLL_CTL_MOD, fd, events, "epoll_ctl(mod)")) {
-    close_connection(fd);  // state is dead after this
+    close_connection(fd);
     return false;
   }
   state.stage = stage;
@@ -290,7 +285,7 @@ void Worker::handle_writable(int fd) {
   }
 
   state.write_offset += static_cast<size_t>(n);
-  if (state.write_offset < data.size()) return;  // partial write
+  if (state.write_offset < data.size()) return;
 
   log_request(state);
   if (!state.keep_alive) {
@@ -303,8 +298,7 @@ void Worker::handle_writable(int fd) {
   state.last_activity = std::chrono::steady_clock::now();
   if (!switch_to(fd, state, EPOLLIN, Stage::kReading)) return;
 
-  // a pipelined request is already in the buffer, and level-triggered epoll
-  // won't wake us again without new data
+  // level-triggered epoll won't wake us again for a request already buffered
   process_buffered(fd, state);
 }
 
@@ -312,8 +306,7 @@ void Worker::log_request(const ConnectionState& state) {
   if (state.status == 0) return;
 
   AccessRecord record;
-  // both arms must be string_view: against a bare "-" the ternary yields a
-  // std::string temporary, and the view outlives it
+  // both arms must be string_view, or the ternary yields a dangling temporary
   record.client_ip =
       state.client_ip.empty() ? std::string_view("-") : std::string_view(state.client_ip);
   record.method = state.method;
@@ -327,14 +320,14 @@ void Worker::log_request(const ConnectionState& state) {
 }
 
 void Worker::close_connection(int fd) {
-  close(fd);  // also drops it from the epoll set
+  close(fd);
   connections_.erase(fd);
 }
 
 void Worker::discard_and_close(int fd) {
   // closing with bytes unread makes the kernel send RST instead of FIN
   char scratch[kReadBlock];
-  for (int i = 0; i < 4; ++i) {  // bounded, or a sending client could pin us
+  for (int i = 0; i < 4; ++i) {
     if (read(fd, scratch, sizeof(scratch)) <= 0) break;
   }
   close_connection(fd);

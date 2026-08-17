@@ -1,10 +1,10 @@
 #include "request_handler.h"
 
 #include <cctype>
-#include <fstream>
-#include <sstream>
 #include <string>
 #include <unordered_map>
+
+#include <unistd.h>
 
 #include "http_parse.h"
 #include "http_response.h"
@@ -13,9 +13,31 @@
 namespace httpserver {
 
 namespace {
-namespace fs = std::filesystem;
 
 constexpr size_t kStreamBlock = 64 * 1024;
+
+class FdGuard {
+ public:
+  explicit FdGuard(int fd) : fd_(fd) {}
+  ~FdGuard() {
+    if (fd_ >= 0) close(fd_);
+  }
+  FdGuard(const FdGuard&) = delete;
+  FdGuard& operator=(const FdGuard&) = delete;
+
+ private:
+  int fd_;
+};
+
+size_t read_block(int fd, std::string& into) {
+  size_t total = 0;
+  while (total < into.size()) {
+    ssize_t n = read(fd, into.data() + total, into.size() - total);
+    if (n <= 0) break;
+    total += static_cast<size_t>(n);
+  }
+  return total;
+}
 
 bool equals_ignoring_case(std::string_view a, std::string_view b) {
   if (a.size() != b.size()) return false;
@@ -25,8 +47,6 @@ bool equals_ignoring_case(std::string_view a, std::string_view b) {
   return true;
 }
 
-// HTTP/1.1 holds the connection open unless the client says otherwise;
-// HTTP/1.0 closes unless the client explicitly asks to keep it
 bool wants_keep_alive(const RequestLine& request_line,
                       const std::unordered_map<std::string, std::string>& headers) {
   const bool http_10 = request_line.version == "HTTP/1.0";
@@ -35,10 +55,10 @@ bool wants_keep_alive(const RequestLine& request_line,
   return http_10 ? equals_ignoring_case(it->second, "keep-alive")
                  : !equals_ignoring_case(it->second, "close");
 }
+
 }
 
-Response handle_request(std::string_view header_text, const fs::path& doc_root,
-                        bool allow_keep_alive) {
+Response handle_request(std::string_view header_text, int doc_root_fd, bool allow_keep_alive) {
   size_t line_end = header_text.find("\r\n");
 
   auto request_line = parse_request_line(header_text.substr(0, line_end));
@@ -63,8 +83,6 @@ Response handle_request(std::string_view header_text, const fs::path& doc_root,
   std::unordered_map<std::string, std::string> headers;
   if (!parse_headers(header_text.substr(line_end + 2), headers)) return error(400, "Bad Request");
 
-  // we don't consume bodies yet, so one would sit in the buffer and be misread
-  // as the next request - refuse rather than desync the stream
   if (headers.count("content-length") || headers.count("transfer-encoding")) {
     return error(501, "Not Implemented");
   }
@@ -73,8 +91,8 @@ Response handle_request(std::string_view header_text, const fs::path& doc_root,
 
   if (request_line->method != "GET") return error(405, "Method Not Allowed", keep_alive);
 
-  fs::path file_path;
-  switch (resolve_path(request_line->path, doc_root, file_path)) {
+  OpenedFile file = open_under_root(request_line->path, doc_root_fd);
+  switch (file.result) {
     case PathResult::kBadRequest:
       return error(400, "Bad Request");
     case PathResult::kForbidden:
@@ -84,24 +102,20 @@ Response handle_request(std::string_view header_text, const fs::path& doc_root,
     case PathResult::kOk:
       break;
   }
+  FdGuard guard(file.fd);
 
-  std::ifstream file(file_path, std::ios::binary);
-  if (!file) return error(404, "Not Found", keep_alive);
+  const std::string_view content_type = content_type_for(file.relative);
 
-  const std::string_view content_type = content_type_for(file_path);
-
-  // read one block first: if it held the whole file we know the length and can
-  // send Content-Length, otherwise we don't and have to chunk
   std::string body(kStreamBlock, '\0');
-  file.read(body.data(), static_cast<std::streamsize>(body.size()));
-  body.resize(static_cast<size_t>(file.gcount()));
-  const bool whole_file_read = !file || file.eof();
+  body.resize(read_block(file.fd, body));
+  const bool whole_file_read = body.size() < kStreamBlock;
 
   if (whole_file_read || request_line->version == "HTTP/1.0") {
-    if (!whole_file_read) {
-      std::ostringstream rest;
-      rest << file.rdbuf();
-      body += rest.str();
+    while (!whole_file_read) {
+      std::string next(kStreamBlock, '\0');
+      next.resize(read_block(file.fd, next));
+      if (next.empty()) break;
+      body += next;
     }
     return respond(build_response(200, "OK", content_type, body, keep_alive), keep_alive, 200);
   }
@@ -110,8 +124,7 @@ Response handle_request(std::string_view header_text, const fs::path& doc_root,
   out += encode_chunk(body);
   while (true) {
     std::string next(kStreamBlock, '\0');
-    file.read(next.data(), static_cast<std::streamsize>(next.size()));
-    next.resize(static_cast<size_t>(file.gcount()));
+    next.resize(read_block(file.fd, next));
     if (next.empty()) break;
     out += encode_chunk(next);
   }

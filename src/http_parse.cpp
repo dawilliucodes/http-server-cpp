@@ -9,7 +9,7 @@ std::optional<RequestLine> parse_request_line(std::string_view line) {
   if (first_space == std::string_view::npos) return std::nullopt;
   size_t second_space = line.find(' ', first_space + 1);
   if (second_space == std::string_view::npos) return std::nullopt;
-  if (line.find(' ', second_space + 1) != std::string_view::npos) return std::nullopt;  // extra token, bail
+  if (line.find(' ', second_space + 1) != std::string_view::npos) return std::nullopt;
 
   RequestLine rl;
   rl.method = std::string(line.substr(0, first_space));

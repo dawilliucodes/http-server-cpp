@@ -14,7 +14,7 @@ struct Config {
   std::string log_path;      // empty = stdout
 };
 
-// nullopt means don't start; exit_code says whether that's an error or --help
+// nullopt = don't start; exit_code says why
 std::optional<Config> parse_args(int argc, char** argv, int& exit_code);
 
 void print_usage(const char* program);

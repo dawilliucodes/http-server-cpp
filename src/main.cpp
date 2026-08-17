@@ -1,5 +1,6 @@
 #include <cerrno>
 #include <csignal>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <memory>
@@ -8,6 +9,7 @@
 #include <vector>
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <sys/epoll.h>
@@ -17,6 +19,7 @@
 
 #include "config.h"
 #include "logging.h"
+#include "static_file.h"
 #include "worker.h"
 
 namespace fs = std::filesystem;
@@ -24,9 +27,8 @@ using namespace httpserver;
 
 namespace {
 
-constexpr int kBacklog = 16;
+constexpr int kBacklog = SOMAXCONN;
 
-// -1 on failure, reason already printed
 int make_listener(uint16_t port) {
   int fd = socket(AF_INET, SOCK_STREAM, 0);
   if (fd < 0) {
@@ -34,7 +36,7 @@ int make_listener(uint16_t port) {
     return -1;
   }
 
-  int opt = 1;  // SO_REUSEADDR, so a restart doesn't hit "address in use"
+  int opt = 1;
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
   addr.sin_port = htons(port);
@@ -75,19 +77,25 @@ std::string ip_of(const sockaddr_in& peer) {
 int main(int argc, char** argv) {
   int exit_code = 0;
   auto parsed = parse_args(argc, argv, exit_code);
-  if (!parsed) return exit_code;  // --help, or bad arguments
+  if (!parsed) return exit_code;
   Config config = *parsed;
 
   std::error_code ec;
   config.doc_root = fs::weakly_canonical(config.doc_root, ec);
-  if (ec || !fs::is_directory(config.doc_root, ec)) {
-    std::cerr << "document root is not a directory: " << config.doc_root << '\n';
+
+  const int doc_root_fd = open(config.doc_root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (doc_root_fd < 0) {
+    std::cerr << "cannot open document root " << config.doc_root << ": " << std::strerror(errno)
+              << '\n';
+    return 1;
+  }
+  if (!resolve_beneath_supported(doc_root_fd)) {
+    std::cerr << "kernel lacks openat2(RESOLVE_BENEATH); needs Linux 5.6 or newer\n";
     return 1;
   }
 
   if (!open_access_log(config.log_path)) return 1;
 
-  // writing to a socket the peer closed raises SIGPIPE, which would kill us
   if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
     fail("signal(SIGPIPE)");
     return 1;
@@ -102,13 +110,13 @@ int main(int argc, char** argv) {
   unsigned int worker_count = config.workers;
   if (worker_count == 0) {
     worker_count = std::thread::hardware_concurrency();
-    if (worker_count == 0) worker_count = 4;  // hardware_concurrency() can return 0
+    if (worker_count == 0) worker_count = 4;
   }
 
   std::vector<std::unique_ptr<Worker>> workers;
   workers.reserve(worker_count);
   for (unsigned int i = 0; i < worker_count; ++i) {
-    auto worker = std::make_unique<Worker>(config.doc_root);
+    auto worker = std::make_unique<Worker>(doc_root_fd);
     if (!worker->init()) return 1;
     worker->start();
     workers.push_back(std::move(worker));
@@ -174,8 +182,6 @@ int main(int argc, char** argv) {
     }
   }
 
-  // the accept queue can still hold connections already carrying a request;
-  // closing the listener on top of those loses it
   accept_all();
 
   close(listen_fd);
@@ -184,7 +190,8 @@ int main(int argc, char** argv) {
 
   close(signal_fd);
   close(accept_epoll);
-  close_access_log();  // after the joins
+  close(doc_root_fd);
+  close_access_log();
   std::cerr << "shutdown complete\n";
   return 0;
 }

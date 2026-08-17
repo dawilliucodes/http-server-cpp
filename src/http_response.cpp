@@ -35,7 +35,7 @@ std::string build_chunked_headers(int status_code, std::string_view reason,
 }
 
 std::string encode_chunk(std::string_view data) {
-  if (data.empty()) return "";  // a zero-length chunk marks the end of the body
+  if (data.empty()) return "";
   char size[32];
   int len = std::snprintf(size, sizeof(size), "%zx\r\n", data.size());
   std::string out(size, static_cast<size_t>(len));

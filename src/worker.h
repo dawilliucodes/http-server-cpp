@@ -2,7 +2,6 @@
 
 #include <atomic>
 #include <cstdint>
-#include <filesystem>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -16,11 +15,9 @@ namespace httpserver {
 
 bool set_nonblocking(int fd);
 
-// one epoll loop on one thread. a connection belongs to the worker it was handed
-// to for its whole life, so none of the per-connection state is shared.
 class Worker {
  public:
-  explicit Worker(std::filesystem::path doc_root);
+  explicit Worker(int doc_root_fd);
   ~Worker();
 
   Worker(const Worker&) = delete;
@@ -28,9 +25,9 @@ class Worker {
 
   bool init();
   void start();
-  void stop();  // thread-safe
+  void stop();
   void join();
-  void hand_off(int fd, std::string client_ip);  // thread-safe
+  void hand_off(int fd, std::string client_ip);
 
  private:
   void run();
@@ -51,7 +48,7 @@ class Worker {
   int epoll_fd_ = -1;
   int event_fd_ = -1;
   int timer_fd_ = -1;
-  std::filesystem::path doc_root_;
+  int doc_root_fd_;
   std::unordered_map<int, ConnectionState> connections_;
 
   std::thread thread_;

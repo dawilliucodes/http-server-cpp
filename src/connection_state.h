@@ -15,7 +15,6 @@ struct ConnectionState {
   bool keep_alive = false;
   std::chrono::steady_clock::time_point last_activity = std::chrono::steady_clock::now();
 
-  // for the access log. the IP is formatted once here rather than per request.
   std::string client_ip;
   std::chrono::steady_clock::time_point request_started;
   int status = 0;

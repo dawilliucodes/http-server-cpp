@@ -37,7 +37,7 @@ std::string timestamp_now() {
 }
 
 bool fail(const char* what) {
-  int err = errno;  // before the lock, which can clobber it
+  int err = errno;
   std::lock_guard<std::mutex> lock(g_log_mutex);
   std::cerr << what << ": " << std::strerror(err) << '\n';
   return false;
@@ -49,7 +49,7 @@ void log_line(const std::string& message) {
 }
 
 bool open_access_log(const std::string& path) {
-  if (path.empty()) return true;  // stdout
+  if (path.empty()) return true;
 
   std::lock_guard<std::mutex> lock(g_access_mutex);
   g_access_file.open(path, std::ios::app);
@@ -78,7 +78,7 @@ void log_access(const AccessRecord& record) {
 
   std::lock_guard<std::mutex> lock(g_access_mutex);
   if (g_access_file.is_open()) {
-    g_access_file << line << std::flush;  // flushed so tail -f keeps up
+    g_access_file << line << std::flush;
   } else {
     std::cout << line << std::flush;
   }

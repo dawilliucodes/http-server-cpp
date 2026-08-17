@@ -62,7 +62,7 @@ std::optional<Config> parse_args(int argc, char** argv, int& exit_code) {
   while ((opt = getopt_long(argc, argv, "p:d:w:l:h", long_options, nullptr)) != -1) {
     unsigned long value = 0;
     switch (opt) {
-      case 'p':  // 0 would have the kernel pick a port we never report
+      case 'p':
         if (!parse_number(optarg, 1, 65535, value)) return reject("port", "1-65535");
         config.port = static_cast<uint16_t>(value);
         break;
@@ -85,7 +85,7 @@ std::optional<Config> parse_args(int argc, char** argv, int& exit_code) {
         exit_code = 0;
         return std::nullopt;
 
-      default:  // getopt_long already said what was wrong
+      default:
         std::cerr << "try '" << argv[0] << " --help'\n";
         exit_code = 2;
         return std::nullopt;

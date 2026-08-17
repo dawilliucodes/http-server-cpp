@@ -19,9 +19,11 @@ A static HTTP/1.1 file server for Linux, written from scratch in C++20 on
 - **Graceful shutdown** on `SIGTERM`/`SIGINT` via `signalfd`: stops accepting,
   answers everything already in flight with `Connection: close`, and exits
   without resetting or dropping a connection.
-- **Path-traversal protection.** Request paths are percent-decoded and
-  canonicalized before being checked against the document root, so `../` and
-  encoded variants like `%2e%2e` are both rejected.
+- **Path-traversal protection enforced by the kernel.** Files are opened with
+  `openat2(RESOLVE_BENEATH)` under a document-root fd, so `../`, encoded
+  variants like `%2e%2e`, absolute paths and escaping symlinks are all refused
+  during resolution — the check and the open are one operation, leaving no
+  window to swap a path between them.
 - **Access logging** with client IP, request line, status, bytes and handling
   time, serialized so lines from different workers can't interleave.
 - **Faults are contained.** An exception anywhere in request handling becomes a
@@ -31,33 +33,82 @@ A static HTTP/1.1 file server for Linux, written from scratch in C++20 on
 
 ## Architecture
 
+The main thread only accepts. Each connection is handed to a worker and stays
+there for life, so its buffers and stage are touched by exactly one thread and
+the request path needs no locking. The one piece of shared state is the access
+log, behind a mutex.
+
 ```
-                ┌───────────────┐
-   clients ────▶│  accept loop  │   main thread: accept() + signalfd, nothing else
-                └───────┬───────┘
-                        │  round-robin hand-off, woken by eventfd
-          ┌─────────────┼─────────────┐
-          ▼             ▼             ▼
-     ┌─────────┐   ┌─────────┐   ┌─────────┐
-     │ worker  │   │ worker  │   │ worker  │   epoll loop + thread each,
-     │ epoll   │   │ epoll   │   │ epoll   │   owning its connections outright
-     └─────────┘   └─────────┘   └─────────┘
+                    ┌─────────────┐
+   clients ────────▶│ accept loop │   main thread: accept() + signalfd
+                    └──────┬──────┘
+                           │ round-robin, handed over via eventfd
+          ┌────────────────┼────────────────┐
+          ▼                ▼                ▼
+   ┌─────────────┐  ┌─────────────┐  ┌─────────────┐
+   │  worker 0   │  │  worker 1   │  │  worker N   │   one thread + epoll each
+   └─────────────┘  └─────────────┘  └─────────────┘
 ```
 
-The main thread does nothing but accept connections and hand each to the next
-worker over that worker's `eventfd`. From then on the connection is that
-worker's alone — its read buffer, write buffer, write offset and stage all live
-in state only that thread touches, so the hot path needs no synchronization at
-all. The only shared state in the process is the access log, behind a mutex.
+Every worker's epoll set holds the same three kinds of fd, and `Worker::run()`
+is a dispatch over which one fired:
 
-Each connection is a small state machine driven by readiness events: read until
-the end of the headers, build a response, switch the socket to write interest,
-write from a stored offset until the buffer drains, then either close or go back
-to reading for the next request on the same connection.
+| fd | fires when |
+|---|---|
+| `eventfd` | the accept loop has handed over new connections |
+| `timerfd` | every 1s, to sweep connections idle longer than 10s |
+| sockets | a live connection is readable or writable |
+
+### Connection lifecycle
+
+Two states, driven entirely by readiness events. Nothing blocks; partial reads
+and writes resume on the next wakeup.
+
+```
+                   ┌──────────────── keep-alive ──────────┐
+                   │                                      │
+                   ▼                                      │
+              ┌─────────┐                     ┌─────────┐ │
+              │ READING │ ───────────────────▶│ WRITING │─┘
+              └────┬────┘                     └────┬────┘
+                   │                               │
+                   │ peer closed                   │ response fully sent,
+                   │ idle 10s → 408, or close      │ and Connection: close
+                   │ headers > 8KB → 413           │ or a write error
+                   ▼                               ▼
+              ┌─────────────────────────────────────────┐
+              │                 CLOSED                  │
+              └─────────────────────────────────────────┘
+```
+
+### Request path
+
+```
+Worker::handle_readable            read bytes into the connection buffer
+  └─ Worker::process_buffered      find \r\n\r\n, enforce the 8KB cap
+       └─ handle_request                              request_handler.cpp
+            ├─ parse_request_line, parse_headers      http_parse.cpp
+            ├─ open_under_root, content_type_for      static_file.cpp
+            └─ build_response, build_chunked_headers  http_response.cpp
+```
+
+Everything below `handle_request` is pure — bytes in, bytes out, no sockets. All
+I/O lives in `worker.cpp` and `main.cpp`, which keeps the protocol logic
+testable and the event loop free of parsing.
+
+Two behaviours worth knowing before changing any of this:
+
+- **Leftover bytes are re-examined immediately** after a response completes,
+  rather than waiting for the next `epoll` wakeup. Level-triggered `epoll` won't
+  re-notify for data it has already delivered, so a pipelined request sitting in
+  the buffer would otherwise hang until the client sent something new.
+- **Shutdown never closes a connection underneath a client.** In-flight requests
+  are answered with `Connection: close` and clients retire the connections
+  themselves; closing early loses whatever the client had already sent.
 
 ## Requirements
 
-- Linux (or WSL2) — uses `epoll`, `eventfd`, `timerfd` and `signalfd`
+- Linux 5.6+ (or WSL2) — uses `epoll`, `eventfd`, `timerfd`, `signalfd` and `openat2`
 - A C++20 compiler (developed against g++ 13)
 - CMake ≥ 3.20
 
@@ -182,6 +233,44 @@ curl -sD- -o /dev/null http://localhost:8080/big.txt | grep -i transfer-encoding
 ls /proc/$(pgrep -x server)/task | wc -l                                         # threads stay fixed
 ```
 
+## Benchmarks
+
+Serving a 1KB file over keep-alive connections, server pinned to 6 CPUs
+(3 physical cores + SMT siblings) on an i7-1355U, load generator pinned to the
+other 6. Median of 3 runs (5 at 1 connection), 30s measured each after 10s warmup.
+
+| connections | 1 worker | 6 workers | p50 | p99 | p99.9 |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 13,449 | 14,816 | 0.03 ms | 0.22 ms | 0.49 ms |
+| 50 | 65,189 | 141,108 | 0.30 ms | 0.82 ms | 1.15 ms |
+| 100 | 76,313 | **149,581** | 0.62 ms | 1.48 ms | 2.15 ms |
+| 500 | 76,817 | 144,880 | 3.36 ms | 5.96 ms | 8.71 ms |
+| 1000 | 69,120 | 145,068 | 6.80 ms | 9.86 ms | 17.37 ms |
+
+Latencies are for the 6-worker column. Across all 38 runs — 91.9 million
+requests — there were **zero errors**: nothing refused, reset or dropped, at any
+concurrency. Memory stays flat, 4.2 MB idle to 6.0 MB with 1000 live
+connections.
+
+Throughput peaks at 100 connections and holds within 3% out to 1000, rather than
+collapsing. The ~2x gain from 6 workers is close to the ceiling for 3 physical
+cores; the clearer win at high concurrency is latency, where p99 drops from 32ms
+to 10ms.
+
+A syscall profile originally showed 7 of 17 syscalls per request going to path
+resolution — `fs::weakly_canonical` issuing five failing `readlink` calls every
+request. Replacing it with `openat2(RESOLVE_BENEATH)` cut that to 2 of 11.5, and
+moved containment into the kernel: the check and the open are now one operation,
+so there's no window in which a symlink can be swapped between them.
+
+Full method, per-run data and analysis: [benchmarks/results.md](benchmarks/results.md).
+
+```bash
+cmake -S . -B build/release -DCMAKE_BUILD_TYPE=Release && cmake --build build/release
+./benchmarks/run.sh                       # ~28 min
+python3 benchmarks/summarize.py benchmarks/raw.csv 30
+```
+
 ## Project layout
 
 ```
@@ -201,6 +290,12 @@ http-server/
 │   ├── test_util.h              # socket and response-framing helpers
 │   ├── http_conformance.cpp
 │   └── graceful_shutdown.cpp
+├── benchmarks/
+│   ├── loadgen.cpp              # closed-loop epoll load generator
+│   ├── run.sh                   # concurrency sweep with core pinning
+│   ├── summarize.py             # raw runs -> medians and tables
+│   ├── raw.csv                  # every individual run
+│   └── results.md               # method, results, syscall profile
 └── www/                         # default document root
 ```
 

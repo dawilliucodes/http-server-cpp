@@ -1,6 +1,5 @@
 #pragma once
 
-// shared by the black-box tests: real sockets only, nothing from src/.
 
 #include <cctype>
 #include <cstdint>
@@ -78,41 +77,59 @@ inline std::string read_until_close(int fd) {
   return out;
 }
 
-// one response, framed by Content-Length or chunked, leaving the connection
-// usable. empty means it closed before a complete response arrived.
-inline std::string read_one_response(int fd) {
-  std::string data;
-  char buf[65536];
+// carries leftover bytes in `buf` so a pipelined next response isn't discarded
+inline std::string read_one_response(int fd, std::string& buf) {
+  char chunk[65536];
+  auto fill = [&] {
+    ssize_t n = recv(fd, chunk, sizeof(chunk), 0);
+    if (n <= 0) return false;
+    buf.append(chunk, static_cast<size_t>(n));
+    return true;
+  };
 
-  while (data.find("\r\n\r\n") == std::string::npos) {
-    ssize_t n = recv(fd, buf, sizeof(buf), 0);
-    if (n <= 0) return "";
-    data.append(buf, static_cast<size_t>(n));
+  while (buf.find("\r\n\r\n") == std::string::npos) {
+    if (!fill()) return "";
   }
 
-  const size_t body_start = data.find("\r\n\r\n") + 4;
-  const std::string head = lower(data.substr(0, body_start));
+  const size_t body_start = buf.find("\r\n\r\n") + 4;
+  const std::string head = lower(buf.substr(0, body_start));
 
+  size_t total = 0;
   if (head.find("transfer-encoding: chunked") != std::string::npos) {
-    while (data.size() < body_start + 5 ||
-           data.compare(data.size() - 5, 5, "0\r\n\r\n") != 0) {
-      ssize_t n = recv(fd, buf, sizeof(buf), 0);
-      if (n <= 0) return "";
-      data.append(buf, static_cast<size_t>(n));
+    size_t at = body_start;
+    while (true) {
+      size_t eol = buf.find("\r\n", at);
+      while (eol == std::string::npos) {
+        if (!fill()) return "";
+        eol = buf.find("\r\n", at);
+      }
+      const size_t size = std::strtoul(buf.substr(at, eol - at).c_str(), nullptr, 16);
+      while (buf.size() < eol + 2 + size + 2) {
+        if (!fill()) return "";
+      }
+      at = eol + 2 + size + 2;
+      if (size == 0) break;
     }
-    return data;
+    total = at;
+  } else {
+    size_t length = 0;
+    if (size_t at = head.find("content-length:"); at != std::string::npos) {
+      length = std::strtoul(head.c_str() + at + 15, nullptr, 10);
+    }
+    total = body_start + length;
+    while (buf.size() < total) {
+      if (!fill()) return "";
+    }
   }
 
-  size_t length = 0;
-  if (size_t at = head.find("content-length:"); at != std::string::npos) {
-    length = std::strtoul(head.c_str() + at + 15, nullptr, 10);
-  }
-  while (data.size() < body_start + length) {
-    ssize_t n = recv(fd, buf, sizeof(buf), 0);
-    if (n <= 0) return "";
-    data.append(buf, static_cast<size_t>(n));
-  }
-  return data;
+  std::string response = buf.substr(0, total);
+  buf.erase(0, total);
+  return response;
+}
+
+inline std::string read_one_response(int fd) {
+  std::string scratch;
+  return read_one_response(fd, scratch);
 }
 
 inline int status_of(const std::string& response) {

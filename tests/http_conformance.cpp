@@ -30,11 +30,12 @@ void check_status(const std::string& name, const std::string& request, int want)
 }
 
 void test_keep_alive() {
+  std::string buf;
   int fd = connect_to();
   send_all(fd, kGet);
-  const std::string first = read_one_response(fd);
+  const std::string first = read_one_response(fd, buf);
   send_all(fd, kGet);
-  const std::string second = read_one_response(fd);
+  const std::string second = read_one_response(fd, buf);
   close(fd);
 
   check("keep-alive: 2 requests on 1 connection",
@@ -49,10 +50,11 @@ void test_keep_alive() {
         status_of(closed) == 200 &&
             lower(headers_of(closed)).find("connection: close") != std::string::npos);
 
+  buf.clear();
   fd = connect_to();
   send_all(fd, kGet + kGet);
-  const std::string p1 = read_one_response(fd);
-  const std::string p2 = read_one_response(fd);
+  const std::string p1 = read_one_response(fd, buf);
+  const std::string p2 = read_one_response(fd, buf);
   close(fd);
   check("pipelined requests both answered", status_of(p1) == 200 && status_of(p2) == 200,
         std::to_string(status_of(p1)) + ", " + std::to_string(status_of(p2)));
@@ -112,7 +114,6 @@ void test_request_size_cap() {
   check_status("413 oversized (terminator present)",
                "GET / HTTP/1.1\r\nX-Pad: " + std::string(9000, 'b') + "\r\n\r\n", 413);
 
-  // the server answers and closes mid-send, so send_all failing here is expected
   int fd = connect_to();
   send_all(fd, "GET / HTTP/1.1\r\n");
   for (int i = 0; i < 12; ++i) {
@@ -131,24 +132,33 @@ void test_request_size_cap() {
   check("just under cap still served", ok == 200, "got " + std::to_string(ok));
 }
 
-void test_exception_becomes_500() {
-  // over PATH_MAX but under the header cap: weakly_canonical throws in the handler
-  const int thrown =
+void test_hostile_paths() {
+  const int too_long =
       status_of(one_shot("GET /" + std::string(5000, 'a') + " HTTP/1.1\r\nHost: x\r\n\r\n"));
-  check("handler exception -> 500", thrown == 500, "got " + std::to_string(thrown));
+  check("path over PATH_MAX -> 400", too_long == 400, "got " + std::to_string(too_long));
+
+  check_status("traversal", "GET /../../etc/passwd HTTP/1.1\r\nHost: x\r\n\r\n", 403);
+  check_status("encoded traversal", "GET /%2e%2e/%2e%2e/etc/passwd HTTP/1.1\r\nHost: x\r\n\r\n", 403);
+  const int missing_dir =
+      status_of(one_shot("GET /a/../../etc/passwd HTTP/1.1\r\nHost: x\r\n\r\n"));
+  check("traversal through a missing directory refused",
+        missing_dir == 403 || missing_dir == 404, "got " + std::to_string(missing_dir));
+  check_status("absolute path", "GET //etc/passwd HTTP/1.1\r\nHost: x\r\n\r\n", 403);
+  check_status("directory, not a file", "GET / HTTP/1.1\r\nHost: x\r\n\r\n", 200);
+  check_status("bare directory -> 404", "GET /. HTTP/1.1\r\nHost: x\r\n\r\n", 404);
 
   int fd = connect_to();
   send_all(fd, kGet);
   const int after = status_of(read_one_response(fd));
   close(fd);
-  check("server alive after handler exception", after == 200, "got " + std::to_string(after));
+  check("server alive after hostile paths", after == 200, "got " + std::to_string(after));
 }
 
 void test_idle_timeout() {
   using clock = std::chrono::steady_clock;
 
   int fd = connect_to(8080, 30);
-  send_all(fd, "GET /index.html HTTP/1.1\r\nHost: x\r\n");  // no blank line
+  send_all(fd, "GET /index.html HTTP/1.1\r\nHost: x\r\n");
   auto started = clock::now();
   const int status = status_of(read_until_close(fd));
   auto waited = std::chrono::duration_cast<std::chrono::seconds>(clock::now() - started).count();
@@ -180,7 +190,7 @@ int main() {
   test_chunked();
   test_status_codes();
   test_request_size_cap();
-  test_exception_becomes_500();
+  test_hostile_paths();
   test_idle_timeout();
   return summary();
 }

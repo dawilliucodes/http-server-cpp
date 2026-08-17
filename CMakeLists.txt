@@ -44,6 +44,13 @@ if(NOT EXISTS ${big_fixture})
   file(WRITE ${big_fixture} "${big_contents}")
 endif()
 
+# 1KB fixture the benchmarks serve, so throughput isn't dominated by file size
+set(bench_fixture ${CMAKE_CURRENT_SOURCE_DIR}/www/bench.txt)
+if(NOT EXISTS ${bench_fixture})
+  string(REPEAT "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde\n" 16 bench_contents)
+  file(WRITE ${bench_fixture} "${bench_contents}")
+endif()
+
 # Black-box tests: they drive the built binary over real sockets and don't link
 # against src/, so they're built plain - no sanitizers, whatever the config.
 find_package(Threads REQUIRED)
@@ -52,3 +59,8 @@ foreach(test_name http_conformance graceful_shutdown)
   target_compile_options(test_${test_name} PRIVATE -Wall -Wextra -Wpedantic -g)
   target_link_libraries(test_${test_name} PRIVATE Threads::Threads)
 endforeach()
+
+# always optimized: a debug-built load generator would measure itself
+add_executable(loadgen benchmarks/loadgen.cpp)
+target_compile_options(loadgen PRIVATE -Wall -Wextra -Wpedantic -O2)
+target_link_libraries(loadgen PRIVATE Threads::Threads)
