@@ -3,6 +3,7 @@
 #include <cctype>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include <unistd.h>
 
@@ -29,10 +30,10 @@ class FdGuard {
   int fd_;
 };
 
-size_t read_block(int fd, std::string& into) {
+size_t read_into(int fd, char* into, size_t len) {
   size_t total = 0;
-  while (total < into.size()) {
-    ssize_t n = read(fd, into.data() + total, into.size() - total);
+  while (total < len) {
+    ssize_t n = read(fd, into + total, len - total);
     if (n <= 0) break;
     total += static_cast<size_t>(n);
   }
@@ -106,27 +107,34 @@ Response handle_request(std::string_view header_text, int doc_root_fd, bool allo
 
   const std::string_view content_type = content_type_for(file.relative);
 
-  std::string body(kStreamBlock, '\0');
-  body.resize(read_block(file.fd, body));
-  const bool whole_file_read = body.size() < kStreamBlock;
+  thread_local std::vector<char> buffer(kStreamBlock);
 
-  if (whole_file_read || request_line->version == "HTTP/1.0") {
-    while (!whole_file_read) {
-      std::string next(kStreamBlock, '\0');
-      next.resize(read_block(file.fd, next));
-      if (next.empty()) break;
-      body += next;
+  const size_t want = (file.size > 0 && file.size < kStreamBlock) ? file.size : kStreamBlock;
+  const size_t got = read_into(file.fd, buffer.data(), want);
+  const std::string_view first_block(buffer.data(), got);
+  const bool whole_file_read = got < want || (file.size > 0 && file.size <= kStreamBlock);
+
+  if (whole_file_read) {
+    return respond(build_response(200, "OK", content_type, first_block, keep_alive), keep_alive,
+                   200);
+  }
+
+  if (request_line->version == "HTTP/1.0") {
+    std::string body(first_block);  // copied out before buffer is reused
+    while (true) {
+      const size_t n = read_into(file.fd, buffer.data(), kStreamBlock);
+      if (n == 0) break;
+      body.append(buffer.data(), n);
     }
     return respond(build_response(200, "OK", content_type, body, keep_alive), keep_alive, 200);
   }
 
   std::string out = build_chunked_headers(200, "OK", content_type, keep_alive);
-  out += encode_chunk(body);
+  out += encode_chunk(first_block);
   while (true) {
-    std::string next(kStreamBlock, '\0');
-    next.resize(read_block(file.fd, next));
-    if (next.empty()) break;
-    out += encode_chunk(next);
+    const size_t n = read_into(file.fd, buffer.data(), kStreamBlock);
+    if (n == 0) break;
+    out += encode_chunk(std::string_view(buffer.data(), n));
   }
   out += final_chunk();
   return respond(std::move(out), keep_alive, 200);

@@ -6,9 +6,15 @@ namespace httpserver {
 
 namespace {
 
-std::string head(int status_code, std::string_view reason, std::string_view content_type) {
-  return "HTTP/1.1 " + std::to_string(status_code) + " " + std::string(reason) +
-         "\r\nContent-Type: " + std::string(content_type) + "\r\n";
+void append_head(std::string& out, int status_code, std::string_view reason,
+                 std::string_view content_type) {
+  out += "HTTP/1.1 ";
+  out += std::to_string(status_code);
+  out += ' ';
+  out += reason;
+  out += "\r\nContent-Type: ";
+  out += content_type;
+  out += "\r\n";
 }
 
 std::string_view connection(bool keep_alive) {
@@ -18,9 +24,19 @@ std::string_view connection(bool keep_alive) {
 }
 
 std::string build_response(int status_code, std::string_view reason, std::string_view content_type,
-                            const std::string& body, bool keep_alive) {
-  return head(status_code, reason, content_type) + "Content-Length: " +
-         std::to_string(body.size()) + "\r\n" + std::string(connection(keep_alive)) + body;
+                            std::string_view body, bool keep_alive) {
+  const std::string length = std::to_string(body.size());
+  const std::string_view tail = connection(keep_alive);
+
+  std::string out;
+  out.reserve(48 + reason.size() + content_type.size() + length.size() + tail.size() + body.size());
+  append_head(out, status_code, reason, content_type);
+  out += "Content-Length: ";
+  out += length;
+  out += "\r\n";
+  out += tail;
+  out += body;
+  return out;
 }
 
 std::string build_error_response(int status_code, std::string_view reason, bool keep_alive) {
@@ -30,8 +46,11 @@ std::string build_error_response(int status_code, std::string_view reason, bool 
 
 std::string build_chunked_headers(int status_code, std::string_view reason,
                                    std::string_view content_type, bool keep_alive) {
-  return head(status_code, reason, content_type) + "Transfer-Encoding: chunked\r\n" +
-         std::string(connection(keep_alive));
+  std::string out;
+  append_head(out, status_code, reason, content_type);
+  out += "Transfer-Encoding: chunked\r\n";
+  out += connection(keep_alive);
+  return out;
 }
 
 std::string encode_chunk(std::string_view data) {

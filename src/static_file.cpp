@@ -104,6 +104,7 @@ OpenedFile open_under_root(const std::string& raw_path, int root_fd) {
   }
 
   out.fd = static_cast<int>(fd);
+  out.size = static_cast<size_t>(info.st_size);
   out.result = PathResult::kOk;
   return out;
 }

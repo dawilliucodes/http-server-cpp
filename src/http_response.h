@@ -6,7 +6,7 @@
 namespace httpserver {
 
 std::string build_response(int status_code, std::string_view reason, std::string_view content_type,
-                            const std::string& body, bool keep_alive);
+                            std::string_view body, bool keep_alive);
 
 std::string build_error_response(int status_code, std::string_view reason, bool keep_alive = false);
 

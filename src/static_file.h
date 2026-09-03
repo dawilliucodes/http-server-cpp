@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <string>
 #include <string_view>
 
@@ -10,6 +11,7 @@ enum class PathResult { kOk, kBadRequest, kForbidden, kNotFound };
 struct OpenedFile {
   PathResult result = PathResult::kNotFound;
   int fd = -1;  // caller closes
+  size_t size = 0;  // from fstat
   std::string relative;
 };
 
