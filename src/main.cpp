@@ -94,8 +94,6 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  if (!open_access_log(config.log_path)) return 1;
-
   if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
     fail("signal(SIGPIPE)");
     return 1;
@@ -106,6 +104,8 @@ int main(int argc, char** argv) {
 
   const int signal_fd = make_signal_fd();
   if (signal_fd < 0) return 1;
+
+  if (!open_access_log(config.log_path)) return 1;
 
   unsigned int worker_count = config.workers;
   if (worker_count == 0) {

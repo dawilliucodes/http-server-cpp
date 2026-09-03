@@ -129,6 +129,13 @@ int main(int argc, char** argv) {
   }
   close(pipe_fds[1]);
 
+  std::string output;
+  std::thread drain([&] {
+    char buf[4096];
+    ssize_t n;
+    while ((n = read(pipe_fds[0], buf, sizeof(buf))) > 0) output.append(buf, static_cast<size_t>(n));
+  });
+
   std::this_thread::sleep_for(std::chrono::milliseconds(800));
 
   std::vector<std::thread> clients;
@@ -151,10 +158,7 @@ int main(int argc, char** argv) {
   g_stop.store(true);
   for (auto& client : clients) client.join();
 
-  std::string output;
-  char buf[4096];
-  ssize_t n;
-  while ((n = read(pipe_fds[0], buf, sizeof(buf))) > 0) output.append(buf, static_cast<size_t>(n));
+  drain.join();  // read() returns 0 once the server's stdout is closed
   close(pipe_fds[0]);
 
   const int exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
