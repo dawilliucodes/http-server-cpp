@@ -11,7 +11,7 @@ One non-blocking event loop per core, no external dependencies.
 - Idle timeouts from a per-worker `timerfd`: 408 mid-request, silent close between requests
 - Graceful shutdown on `SIGTERM`/`SIGINT` via `signalfd`, with no connection resets
 - Path traversal blocked in-kernel by `openat2(RESOLVE_BENEATH)`, so there is no TOCTOU window
-- Access log with client IP, request, status, bytes and handling time, serialized across workers
+- Access log with client IP, request, status, bytes and handling time, buffered per worker and written by a separate thread so it never blocks an event loop
 - An exception becomes a 500 for that one connection, it never takes down the worker
 - Status codes: 200, 400, 403, 404, 405, 408, 413, 500, 501
 
@@ -125,8 +125,12 @@ timestamp (UTC, us)         client    request        status  bytes  handling tim
 
 Timestamps sort lexicographically. The duration covers a complete request being parsed
 through to the last byte written, so it measures handling and not how long the client
-took. A request too broken to parse logs `"- -"`. Each line is built before the lock and
-written in one call, so workers never interleave, and every line is flushed for `tail -f`.
+took. A request too broken to parse logs `"- -"`.
+
+A worker appends finished lines to a buffer it owns; a separate writer thread collects
+those buffers every 50ms and writes them in one call. Nothing on the request path takes a
+shared lock or makes a syscall to log, so a slow log destination can't stall an event
+loop. A worker that gets more than 4MB ahead of the writer drops lines and says how many.
 
 ## Testing
 
@@ -155,22 +159,34 @@ measured after a 10s warmup.
 
 | connections | 1 worker | 6 workers | p50 | p99 | p99.9 |
 |---:|---:|---:|---:|---:|---:|
-| 1 | 13,449 | 14,816 | 0.03 ms | 0.22 ms | 0.49 ms |
-| 50 | 65,189 | 141,108 | 0.30 ms | 0.82 ms | 1.15 ms |
-| 100 | 76,313 | **149,581** | 0.62 ms | 1.48 ms | 2.15 ms |
-| 500 | 76,817 | 144,880 | 3.36 ms | 5.96 ms | 8.71 ms |
-| 1000 | 69,120 | 145,068 | 6.80 ms | 9.86 ms | 17.37 ms |
+| 1 | 18,302 | 14,800 | 0.04 ms | 0.14 ms | 0.36 ms |
+| 50 | 91,301 | 209,022 | 0.18 ms | 0.58 ms | 0.81 ms |
+| 100 | 98,127 | 276,372 | 0.27 ms | 0.90 ms | 1.23 ms |
+| 500 | 101,868 | **305,005** | 1.30 ms | 3.63 ms | 4.79 ms |
+| 1000 | 82,367 | 256,887 | 3.22 ms | 6.77 ms | 8.15 ms |
 
-Latencies are the 6-worker column. Across 38 runs and 91.9M requests there were **zero
-errors**. Memory stays flat: 4.2 MB idle, 6.0 MB with 1000 live connections.
+Latencies are the 6-worker column. Across 72 runs and 255.7M requests nothing was refused,
+reset or dropped. At peak the server holds 5.98 of its 6 pinned cores, so it is the limit
+rather than the load generator. Memory is 4.2 MB idle and 14 MB at peak throughput, most of
+the difference being access-log buffers.
 
-Profiling found that 7 of the 17 syscalls per request went to path canonicalization,
-where `fs::weakly_canonical` issued five `readlink` calls that all failed. Replacing it
-with `openat2(RESOLVE_BENEATH)` cut that to 2 of 11.5 and raised throughput by 14-16%
-(up to 42% with a single worker), while moving containment into the kernel.
+The two columns use different load-generator thread counts, because one setting cannot keep
+both configurations server-bound: 6 workers need 4 client threads to reach saturation, while
+1 worker is measured most favourably with 2. Both are verified server-bound from the CPU
+column. [benchmarks/results.md](benchmarks/results.md) has the argument and the raw runs.
+
+Two rounds of profiling account for most of the throughput:
+
+- **Path resolution.** 7 of 17 syscalls per request went to canonicalization, where
+  `fs::weakly_canonical` issued five `readlink` calls that all failed. `openat2(RESOLVE_BENEATH)`
+  cut that to 2 of 11.5, raised throughput 14-16% (42% single-worker), and moved containment
+  into the kernel.
+- **The access log.** It held a global mutex and made a blocking `write()` on the event loop,
+  which capped the server at 5.2 of 6 cores however much load arrived. Per-worker buffers
+  drained by a writer thread lifted 6-worker throughput **96-179%**.
 
 ```bash
-./benchmarks/run.sh                                   # ~28 min
+./benchmarks/run.sh                                   # ~25 min
 python3 benchmarks/summarize.py benchmarks/raw.csv 30
 ```
 
